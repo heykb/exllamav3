@@ -10,6 +10,10 @@ from ..modules import Embedding, Linear, GatedResidual
 from ..modules.module import Module
 from ..modules.arch_specific.qwen4_exp_mtp import Qwen4ExpMTPInputLayer
 from ..modules.attn import prepare_for_attn
+from ..ext import exllamav3_ext as ext
+import os
+
+MTP_HEAD_SIZE = int(os.environ.get("EXL3_MTP_HEAD_N", "65536"))
 
 from typing import TYPE_CHECKING
 if TYPE_CHECKING:
@@ -173,5 +177,57 @@ class Qwen4ExpMTPModel(Model):
         bsz, seq, _ = state.shape
         stack = to_device(state, mixer.device).view(bsz, seq, mixer.hc_mult, mixer.hidden_size)
         state = mixer.forward(stack, params)
-        # The target's head, TP-aware; exports draft confidence when the generator asks
-        return self.attached_model().lm_head_argmax(state, params)
+        target = self.attached_model()
+        if target.loaded_tp:
+            return target.lm_head_argmax(state, params)
+
+        lm_head = target.modules[target.logit_layer_idx]
+        state = lm_head.prepare_for_device(state, params)
+        pruned_head = self._get_pruned_head(lm_head, state.device)
+        if pruned_head is None:
+            return target.lm_head_argmax(state, params)
+
+        trellis, output_scale, output_size = pruned_head
+        inner = lm_head.inner
+        batch_size, sequence_len, hidden_size = state.shape
+        state_2d = state.reshape(batch_size * sequence_len, hidden_size)
+        if state_2d.dtype != torch.half:
+            state_2d = state_2d.half()
+        state_2d = state_2d.contiguous()
+        transformed_state = torch.empty_like(state_2d)
+        logits = torch.empty(
+            (batch_size * sequence_len, output_size),
+            dtype = torch.half,
+            device = state_2d.device,
+        )
+        ext.exl3_gemm(
+            state_2d, trellis, logits, inner.suh, transformed_state, output_scale,
+            -1, inner.mcg, inner.mul1, 0,
+        )
+        if params.get("export_draft_conf"):
+            confidence, token_ids = torch.max(logits, dim = -1)
+            params["draft_conf"] = confidence.view(batch_size, sequence_len)
+            return token_ids.view(batch_size, sequence_len)
+        return torch.argmax(logits, dim = -1).view(batch_size, sequence_len)
+
+    def _get_pruned_head(self, lm_head, device):
+        cached_head = getattr(self, "_pruned_head_cache", None)
+        if cached_head is not None:
+            return cached_head if cached_head is not False else None
+
+        inner = getattr(lm_head, "inner", None)
+        trellis = getattr(inner, "trellis", None)
+        if trellis is None or getattr(inner, "bias", None) is not None or not hasattr(inner, "svh"):
+            self._pruned_head_cache = False
+            return None
+
+        full_size = trellis.shape[1] * 16
+        output_size = min(MTP_HEAD_SIZE, full_size) // 128 * 128
+        if output_size <= 0 or output_size >= full_size:
+            self._pruned_head_cache = False
+            return None
+
+        pruned_trellis = trellis[:, :output_size // 16, :].contiguous().to(device)
+        pruned_output_scale = inner.svh[:output_size].contiguous().to(device)
+        self._pruned_head_cache = (pruned_trellis, pruned_output_scale, output_size)
+        return self._pruned_head_cache
