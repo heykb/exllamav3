@@ -7,6 +7,10 @@ from ..util.tensor import to2
 from . import Module
 from ..tokenizer.mm_embedding import FIRST_MM_EMBEDDING_INDEX
 from ..model.model_tp_alloc import TPAllocation
+import os
+
+EMBED_GPU_ENABLED = os.environ.get("EXL3_EMBED_GPU", "1") != "0"
+EMBED_GPU_MAX_BYTES = int(os.environ.get("EXL3_EMBED_GPU_MAX_MB", "4096")) << 20
 
 class Embedding(Module):
 
@@ -30,6 +34,8 @@ class Embedding(Module):
         self.hidden_size = hidden_size
         self.out_dtype = out_dtype
         self._pinned_staging = {}
+        self._gpu_embedding_weight = None
+        self._gpu_embedding_device = None
         self._numel = vocab_size * hidden_size
         self.normalize = normalize
         self.multiplier = multiplier
@@ -58,6 +64,8 @@ class Embedding(Module):
     def unload(self):
         self.device = None
         self.embedding = None
+        self._gpu_embedding_weight = None
+        self._gpu_embedding_device = None
 
     @override
     def get_tensors(self):
@@ -145,7 +153,14 @@ class Embedding(Module):
 
         # No indexed embeddings, or none in current batch
         else:
-            x = self.embedding.forward(x)
+            if x.device.type == "cuda" and self.device is not None and self.device.type == "cpu":
+                gpu_weight = self._get_gpu_embedding_weight(x.device)
+                if gpu_weight is not None:
+                    x = torch.nn.functional.embedding(x, gpu_weight)
+                else:
+                    x = self.embedding.forward(x.cpu())
+            else:
+                x = self.embedding.forward(x)
             if self.multiplier != 1.0:
                 x *= self.multiplier
             x = to2(x, out_dtype, self.out_dtype)
@@ -166,6 +181,17 @@ class Embedding(Module):
                 buf.copy_(x)
                 x = buf
             return x
+
+    def _get_gpu_embedding_weight(self, device: torch.device):
+        if not EMBED_GPU_ENABLED:
+            return None
+        weight = self.embedding.weight.data
+        if weight.numel() * weight.element_size() > EMBED_GPU_MAX_BYTES:
+            return None
+        if self._gpu_embedding_weight is None or self._gpu_embedding_device != device:
+            self._gpu_embedding_weight = weight.to(device)
+            self._gpu_embedding_device = device
+        return self._gpu_embedding_weight
 
     def make_tp_allocation(self, options: dict) -> list[TPAllocation]:
         return []

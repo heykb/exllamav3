@@ -22,6 +22,10 @@ import time
 import threading
 from ..tokenizer import MMEmbedding
 from ..util import profile_opt
+import os
+
+BATCH_VERIFY_ENABLED = os.environ.get("EXL3_BATCH_VERIFY", "1") != "0"
+MTP_DEVICE_DRAFT_ENABLED = os.environ.get("EXL3_MTP_DEVICE_DRAFT", "1") != "0"
 
 class Generator:
 
@@ -44,7 +48,7 @@ class Generator:
         recurrent_checkpoint_interval_pp: int = 32768,
         ngram_match_min: int = 0,
         dynamic_draft_tokens: bool = False,
-        draft_confidence: float = 0.4,
+        draft_confidence: float | None = None,
         record_draft_stats: bool = False,
         ngram_corpus: str | None = None,
         **kwargs
@@ -108,7 +112,7 @@ class Generator:
             everything before it is accepted too) drafting stops when the running product of conditional
             estimates - the probability that the next position actually contributes a token - falls below the
             target. Lower values keep longer drafts; higher values truncate more aggressively. Ignored for
-            n-gram drafting.
+            n-gram drafting. None reads EXL3_DRAFT_CONFIDENCE from the environment, defaulting to 0.4.
 
         :param record_draft_stats:
             Append (position, window, accepted) per verification round to job.draft_stats, for analysis.
@@ -274,6 +278,9 @@ class Generator:
         # leaving the calibrator inert
         self.draft_calibrator = None
         self._draft_conf_round = None
+        if draft_confidence is None:
+            draft_confidence = float(os.environ.get("EXL3_DRAFT_CONFIDENCE", "0.4"))
+        self.draft_confidence = draft_confidence
         if self.dynamic_draft and self.draft_model is not None:
             self.draft_calibrator = DraftConfidenceCalibrator(draft_confidence)
 
@@ -762,9 +769,17 @@ class Generator:
             job_ids = job.get_input_ids_list()
             input_ids_list += job_ids
             mtp_hidden_list.append(job.mtp_last_hidden)
-        batch_ids = self.draft_input_ids_pinned[:batch_size, :]
-        batch_ids.copy_(torch.cat(input_ids_list, dim = 0))
         temp_hidden = torch.cat(mtp_hidden_list, dim = 0)
+        use_device_draft = MTP_DEVICE_DRAFT_ENABLED and temp_hidden.is_cuda
+        if use_device_draft:
+            draft_device = temp_hidden.device
+            batch_ids = torch.cat(input_ids_list, dim = 0).to(draft_device, non_blocking = True)
+            device_draft_ids = torch.empty(
+                (batch_size, self.num_draft_tokens), dtype = torch.long, device = draft_device
+            )
+        else:
+            batch_ids = self.draft_input_ids_pinned[:batch_size, :]
+            batch_ids.copy_(torch.cat(input_ids_list, dim = 0))
 
         # Greedy sample batched draft tokens. As in iterate_draftmodel_gen, drafting stops once
         # every row's running product of estimated conditional acceptance probabilities falls
@@ -788,8 +803,12 @@ class Generator:
             lm_head = self.model.modules[self.model.logit_layer_idx]
             batch_state = lm_head.prepare_for_device(batch_state, params)
             new_ids = self.draft_model.sample_from_state(batch_state, params)
-            self.draft_ids_pinned[:batch_size, idx:idx+1].copy_(new_ids)
-            batch_ids.copy_(new_ids)
+            if use_device_draft:
+                device_draft_ids[:, idx:idx+1].copy_(new_ids)
+                batch_ids = new_ids
+            else:
+                self.draft_ids_pinned[:batch_size, idx:idx+1].copy_(new_ids)
+                batch_ids.copy_(new_ids)
             cache_seqlens += 1
             temp_hidden = batch_state
             draft_conf = params.get("draft_conf")
@@ -801,6 +820,9 @@ class Generator:
                 if idx + 1 < window and max(reach) < cal.confidence:
                     window = idx + 1
                     break
+
+        if use_device_draft:
+            self.draft_ids_pinned[:batch_size, :window].copy_(device_draft_ids[:, :window])
 
         if conf_cols and len(conf_cols) == window:
             self._draft_conf_round = {
@@ -1176,11 +1198,40 @@ class Generator:
                 accepted_length = 1
                 rejected = 0
 
+                verified_tokens = None
+                verified_matches = None
+                if (
+                    BATCH_VERIFY_ENABLED and draft_tokens is not None and batch_logits.shape[1] > 1 and
+                    len(job.sequences) == 1 and not job.filters and job.forced_ids is None and
+                    not job.return_probs and job.return_top_tokens == 0 and job.new_tokens >= 0 and
+                    not job.sampler.reqs_past_ids and job.device_logit_mask is None and
+                    job.sampler.supports_batch_verify
+                ):
+                    verify_len = batch_logits.shape[1]
+                    sampled_tokens = job.sampler.forward(
+                        job_logits.view(verify_len, 1, -1),
+                        None,
+                        job.rng.randint(0, (1 << 32) - 1),
+                        self.tokenizer,
+                        logit_mask = None,
+                    ).view(verify_len)
+                    draft_row = draft_tokens[j, :verify_len - 1].to(
+                        sampled_tokens.device, non_blocking = True
+                    )
+                    matches = sampled_tokens[:verify_len - 1] == draft_row
+                    verified = torch.cat([sampled_tokens, matches.to(sampled_tokens.dtype)]).cpu()
+                    verified_tokens = verified[:verify_len]
+                    verified_matches = verified[verify_len:].tolist()
+
                 for i in range(batch_logits.shape[1]):
                     token_logits = job_logits[:, i:i + 1, :]
-                    next_token, next_k_tokens, next_k_probs, next_prob = job.receive_logits(
-                        token_logits,
-                    )
+                    if verified_tokens is not None:
+                        next_token = verified_tokens[i:i + 1].view(1, 1)
+                        next_k_tokens = next_k_probs = next_prob = None
+                    else:
+                        next_token, next_k_tokens, next_k_probs, next_prob = job.receive_logits(
+                            token_logits,
+                        )
                     eos, sampled_token, rq = job.receive_sample(
                         token_logits,
                         next_token,
@@ -1235,7 +1286,11 @@ class Generator:
                     # draft acceptance so state can be stashed at an exact page boundary.
                     if draft_tokens is not None and i < batch_logits.shape[1] - 1:
                         cp_boundary = batch_states is not None and job.is_checkpoint_boundary()
-                        if draft_tokens[j, i].item() != sampled_token.item() or cp_boundary:
+                        token_mismatch = (
+                            not verified_matches[i] if verified_matches is not None else
+                            draft_tokens[j, i].item() != sampled_token.item()
+                        )
+                        if token_mismatch or cp_boundary:
                             rejected = reject_remainder(job, j, i, batch_states)
                             break
 
