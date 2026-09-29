@@ -10,6 +10,8 @@ from ..util.tensor import g_tensor_cache
 import os
 import math
 
+GR_INT8_ENABLED = os.environ.get("EXL3_GR_INT8", "1") != "0"
+
 # Prefill-sized GatedResidual mixes run the tiled deterministic kernel (rank-consistent under
 # TP, see hc_mix_tiled.cu); 0 falls back to the cuBLAS GEMM path
 _gr_mix_tiled_enable = os.environ.get("EXL3_GR_MIX_TILED", "1") != "0"
@@ -279,6 +281,10 @@ class GatedResidual(Module):
                                     # of 64 rows for the tiled path (GEMM paths use [:proj_m])
         self.proj_m = 0             # rows of proj_h in use: rank (+ hc_mult in the site form)
         self.fn_h = None            # cat(down, inject) * w half, folded (fused path)
+        self.fn_q = None            # int8 decode copy of fn_h
+        self.fn_s = None            # per-row fp32 scales for fn_q
+        self.upx_q = None           # int8 decode copy of upx_h
+        self.upx_s = None           # per-output-channel fp32 scales for upx_q
         self.rank = 0
         self.tiled = False          # prefill mixes take the tiled deterministic kernel
         self.proj_i8 = None         # (2, Mpad, hc_mult * hidden) int8 hi/lo slices (tiled path)
@@ -352,16 +358,33 @@ class GatedResidual(Module):
         # up repacked (H, D/4, rank, 4) so the fused kernel's rank loop reads lane-contiguous
         self.upx_h = self.up_h.view(H, Dh // 4, 4, self.rank) \
             .permute(0, 1, 3, 2).contiguous()
+        if GR_INT8_ENABLED and dev.type == "cuda" and not keep_source_weights:
+            self._quantize_decode_weights(H, Dh)
         if self.tiled and not keep_source_weights:
             # Every inference consumer now reads the int8 tables (tiled path) or the folded and
             # repacked copies (fused decode path): release the fp16 sources
             self.proj_h = self.down_h = self.inject_h = self.up_h = None
+
+    def _quantize_decode_weights(self, stream_count: int, hidden_size: int):
+        quant_max = 127.0
+        folded = self.fn_h.float()
+        folded_scale = folded.abs().amax(dim = 1).clamp_min(1e-8) / quant_max
+        self.fn_q = torch.round(folded / folded_scale[:, None]).clamp_(-128, 127).to(torch.int8).contiguous()
+        self.fn_s = folded_scale.contiguous()
+
+        up = self.upx_h.float()
+        up_scale = up.abs().amax(dim = 2).clamp_min(1e-8) / quant_max
+        self.upx_q = torch.round(up / up_scale[:, :, None, :]).clamp_(-128, 127).to(torch.int8).contiguous()
+        self.upx_s = up_scale.reshape(stream_count, hidden_size).contiguous()
+        self.fn_h = None
+        self.upx_h = None
 
     @override
     def unload(self):
         super().unload()
         self.norm_w_raw = self.norm_w = self.w_h = None
         self.down_h = self.up_h = self.upx_h = self.inject_h = self.proj_h = self.fn_h = None
+        self.fn_q = self.fn_s = self.upx_q = self.upx_s = None
         self.proj_i8 = self.proj_sb = self.up_i8 = self.up_sb = None
 
     @override
@@ -428,11 +451,18 @@ class GatedResidual(Module):
                 if cached:
                     return g_tensor_cache.get_bucketed(dev, numel, dtype, tag)
                 return torch.empty((numel,), dtype = dtype, device = dev)
-            M = self.fn_h.shape[0] + 1
+            folded_weights = self.fn_q if self.fn_q is not None else self.fn_h
+            M = folded_weights.shape[0] + 1
             dots = ws(R * M * H, torch.float, "gr_mix_dots").view(R, M, H)
             post = ws(R * H, torch.float, "gr_mix_post").view(R, H) if self.use_combine else None
             mixed = ws(R * Dh, torch.half, "gr_mix_mixed").view(R, Dh)
-            ext.gr_mix(s3, self.fn_h, self.upx_h, self.w_h, self.rms_eps, dots, post, mixed)
+            if self.fn_q is not None:
+                ext.gr_mix_int8(
+                    s3, self.fn_q, self.fn_s, self.upx_q, self.upx_s,
+                    self.w_h, self.rms_eps, dots, post, mixed,
+                )
+            else:
+                ext.gr_mix(s3, self.fn_h, self.upx_h, self.w_h, self.rms_eps, dots, post, mixed)
         elif self.tiled:
             # Prefill-shaped workspaces are per-call (pow2-rounded so the caching allocator
             # reuses segments across chunk sizes), never statics

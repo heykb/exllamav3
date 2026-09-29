@@ -715,6 +715,193 @@ void gr_finalize_kernel2(const float* __restrict__ streams, const float* __restr
     gr_finalize_block<H, HALF_OUT, NIT>(streams, dots, upt, w, post, mixed, D, LR, R, rms_eps, blockIdx.x);
 }
 
+// int8-weight variants (EXL3_GR_INT8). Same math and reduction order as gr_dots_kernel /
+// gr_finalize_kernel; only the weight load differs: int8 x per-row fp32 scale instead of half.
+// fn_q: (M, H * D) int8, fn_s: (M) float   -- row j dequantizes as fn_q[j, :] * fn_s[j]
+// up_q: (H, D / 4, LR, 4) int8, up_s: (H, D) float -- channel (h, d) scale, constant over LR
+// Because each scale is constant along the contracted dim, it factors out of the k-loop:
+//   sum_k s[k] * (q[k] * scale) == scale * sum_k s[k] * q[k]   (exact in real arithmetic; in
+// fp32 the rounding pattern differs slightly from multiplying inside the loop, but this is the
+// SAME trajectory whether the reference is "fp16 kernel on dequantized weights" or not -- the
+// reference to compare against is gr_parity's fp32 torch path on the dequantized weights).
+
+template <int H>
+__global__ __launch_bounds__(GR_THREADS_A)
+void gr_dots_i8_kernel
+(
+    const float* __restrict__ streams,   // (R, H, D)
+    const int8_t* __restrict__ fn_q,     // (M, H * D) int8
+    const float* __restrict__ fn_s,      // (M) per-row scale
+    float* __restrict__ dots,            // (R, M + 1, H)
+    const int M,
+    const int D
+)
+{
+    const int r = blockIdx.y;
+    const int j = blockIdx.x;
+    const int D4 = D / 4;
+    const float4* s4 = (const float4*) (streams + (size_t) r * H * D);
+
+    __shared__ float red[H][GR_THREADS_A / 32];
+    const int lane = threadIdx.x % 32;
+    const int warp = threadIdx.x / 32;
+    const float sj = (j < M) ? fn_s[j] : 1.0f;
+
+    #pragma unroll
+    for (int h = 0; h < H; ++h)
+    {
+        float a = 0.0f;
+        if (j < M)
+        {
+            // 8-byte int8 loads (8 weights) against two 16-byte stream quads: same 8-wide
+            // step as the half kernel's 16-byte load, half the weight bytes
+            const int2* f8 = (const int2*) (fn_q + ((size_t) j * H + h) * D);
+            for (int c = threadIdx.x; c < D4 / 2; c += GR_THREADS_A)
+            {
+                float4 s0 = s4[(size_t) h * D4 + 2 * c];
+                float4 s1 = s4[(size_t) h * D4 + 2 * c + 1];
+                int2 pk = f8[c];
+                const int8_t* q = (const int8_t*) &pk;
+                a = fmaf(s0.x, (float) q[0], a);
+                a = fmaf(s0.y, (float) q[1], a);
+                a = fmaf(s0.z, (float) q[2], a);
+                a = fmaf(s0.w, (float) q[3], a);
+                a = fmaf(s1.x, (float) q[4], a);
+                a = fmaf(s1.y, (float) q[5], a);
+                a = fmaf(s1.z, (float) q[6], a);
+                a = fmaf(s1.w, (float) q[7], a);
+            }
+        }
+        else
+        {
+            for (int c = threadIdx.x; c < D4; c += GR_THREADS_A)
+            {
+                float4 s = s4[(size_t) h * D4 + c];
+                a = fmaf(s.x, s.x, fmaf(s.y, s.y, fmaf(s.z, s.z, fmaf(s.w, s.w, a))));
+            }
+        }
+        for (int offset = 16; offset > 0; offset >>= 1)
+            a += __shfl_down_sync(0xffffffffu, a, offset);
+        if (lane == 0) red[h][warp] = a;
+    }
+    __syncthreads();
+    if (threadIdx.x < H)
+    {
+        float v = 0.0f;
+        #pragma unroll
+        for (int w = 0; w < GR_THREADS_A / 32; ++w)
+            v += red[threadIdx.x][w];
+        dots[((size_t) r * (M + 1) + j) * H + threadIdx.x] = v * sj;
+    }
+}
+
+template <int H, bool HALF_OUT>
+__global__ __launch_bounds__(NUM_THREADS)
+void gr_finalize_i8_kernel
+(
+    const float* __restrict__ streams,   // (R, H, D)
+    const float* __restrict__ dots,      // (R, M + 1, H)
+    const int8_t* __restrict__ up_q,     // (H, D / 4, LR, 4) int8
+    const float* __restrict__ up_s,      // (H, D) per-channel scale
+    const half* __restrict__ w,          // (H * D) half norm weight
+    float* __restrict__ post,
+    void* __restrict__ mixed,
+    const int D,
+    const int LR,
+    const int chunk_cols,
+    const float rms_eps
+)
+{
+    const int r = blockIdx.y;
+    const int M = LR + (post ? H : 0);
+    const float* dr = dots + (size_t) r * (M + 1) * H;
+
+    __shared__ float rmr_s[H];
+    extern __shared__ float t_s[];
+    if (threadIdx.x < H)
+        rmr_s[threadIdx.x] = rsqrtf(dr[(size_t) M * H + threadIdx.x] / (float) D + rms_eps);
+    __syncthreads();
+    const float inv_h = 1.0f / (float) H;
+    for (int i = threadIdx.x; i < LR; i += NUM_THREADS)
+    {
+        float v = 0.0f;
+        #pragma unroll
+        for (int h = 0; h < H; ++h)
+            v = fmaf(rmr_s[h], dr[(size_t) i * H + h], v);
+        v *= inv_h;
+        t_s[i] = v * sigmoidf_(v);
+    }
+    if (post && blockIdx.x == 0 && threadIdx.x < H)
+    {
+        float v = 0.0f;
+        #pragma unroll
+        for (int h = 0; h < H; ++h)
+            v = fmaf(rmr_s[h], dr[(size_t) (LR + threadIdx.x) * H + h], v);
+        post[(size_t) r * H + threadIdx.x] = 2.0f * sigmoidf_(v * inv_h);
+    }
+    __syncthreads();
+
+    const int c0 = blockIdx.x * chunk_cols;
+    const int c1 = min(c0 + chunk_cols, D);
+    const int D4 = D / 4;
+    const int lane = threadIdx.x % 32;
+    const int warp = threadIdx.x / 32;
+    const float4* s4 = (const float4*) (streams + (size_t) r * H * D);
+    for (int c = c0 / 4 + warp; c < c1 / 4; c += NUM_THREADS / 32)
+    {
+        float4 g[H];
+        #pragma unroll
+        for (int h = 0; h < H; ++h) g[h] = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        for (int i = lane; i < LR; i += 32)
+        {
+            float ti = t_s[i];
+            #pragma unroll
+            for (int h = 0; h < H; ++h)
+            {
+                // (H, D/4, LR, 4) int8: consecutive lanes read consecutive 4-byte quads
+                int u = *(const int*) (up_q + ((((size_t) h * (D / 4) + c) * LR + i) * 4));
+                const int8_t* q = (const int8_t*) &u;
+                g[h].x = fmaf(ti, (float) q[0], g[h].x);
+                g[h].y = fmaf(ti, (float) q[1], g[h].y);
+                g[h].z = fmaf(ti, (float) q[2], g[h].z);
+                g[h].w = fmaf(ti, (float) q[3], g[h].w);
+            }
+        }
+        #pragma unroll
+        for (int h = 0; h < H; ++h)
+            for (int offset = 16; offset > 0; offset >>= 1)
+            {
+                g[h].x += __shfl_xor_sync(0xffffffffu, g[h].x, offset);
+                g[h].y += __shfl_xor_sync(0xffffffffu, g[h].y, offset);
+                g[h].z += __shfl_xor_sync(0xffffffffu, g[h].z, offset);
+                g[h].w += __shfl_xor_sync(0xffffffffu, g[h].w, offset);
+            }
+        if (lane != 0) continue;
+        float4 o = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        #pragma unroll
+        for (int h = 0; h < H; ++h)
+        {
+            float4 s = s4[(size_t) h * D4 + c];
+            half4 wq = *(const half4*) (w + (size_t) h * D + 4 * c);
+            float4 us = *(const float4*) (up_s + (size_t) h * D + 4 * c);
+            float coef = rmr_s[h] * inv_h;
+            o.x = fmaf(sigmoidf_(g[h].x * us.x) * coef * LOW_TO_FLOAT(wq.x),  s.x, o.x);
+            o.y = fmaf(sigmoidf_(g[h].y * us.y) * coef * HIGH_TO_FLOAT(wq.x), s.y, o.y);
+            o.z = fmaf(sigmoidf_(g[h].z * us.z) * coef * LOW_TO_FLOAT(wq.y),  s.z, o.z);
+            o.w = fmaf(sigmoidf_(g[h].w * us.w) * coef * HIGH_TO_FLOAT(wq.y), s.w, o.w);
+        }
+        if (HALF_OUT)
+        {
+            half2* out2 = (half2*) ((half*) mixed + (size_t) r * D);
+            out2[c * 2] = __floats2half2_rn(o.x, o.y);
+            out2[c * 2 + 1] = __floats2half2_rn(o.z, o.w);
+        }
+        else
+            ((float4*) ((float*) mixed + (size_t) r * D))[c] = o;
+    }
+}
+
+
 // Residual update for one sublayer site: x[h, d] <- post[h] * y[d] + sum_h' comb[h', h] *
 // x[h', d]. Without comb (GatedResidual): x[h, d] <- post[h] * y[d] + x[h, d]. Pure per-column
 // mix of the H stream rows, so it runs in place: each thread loads all H values of its columns
@@ -1103,5 +1290,72 @@ void gr_mix
     else
         gr_finalize_kernel<4, false><<<grid_c, NUM_THREADS, smem, stream>>>(ARGS);
     #undef ARGS
+    cuda_check(cudaPeekAtLastError());
+}
+
+void gr_mix_int8
+(
+    const at::Tensor& streams,           // (R, H, D) float
+    const at::Tensor& fn_q,              // (M, H * D) int8
+    const at::Tensor& fn_s,              // (M) float
+    const at::Tensor& up_q,              // (H, D / 4, LR, 4) int8
+    const at::Tensor& up_s,              // (H, D) float
+    const at::Tensor& w,                 // (H * D) half
+    double rms_eps,
+    at::Tensor dots,
+    c10::optional<at::Tensor> post,
+    at::Tensor mixed
+)
+{
+    const at::cuda::OptionalCUDAGuard device_guard(streams.device());
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+
+    TORCH_CHECK_DTYPE(streams, kFloat);
+    TORCH_CHECK(fn_q.dtype() == at::kChar && up_q.dtype() == at::kChar, "gr_mix_int8: int8 weights required");
+    TORCH_CHECK_DTYPE(fn_s, kFloat);
+    TORCH_CHECK_DTYPE(up_s, kFloat);
+    TORCH_CHECK_DTYPE(w, kHalf);
+    TORCH_CHECK_DTYPE(dots, kFloat);
+    TORCH_CHECK(streams.is_contiguous() && fn_q.is_contiguous() && up_q.is_contiguous() &&
+                fn_s.is_contiguous() && up_s.is_contiguous() && w.is_contiguous() && dots.is_contiguous(),
+                "gr_mix_int8: contiguous inputs required");
+    int R = streams.size(0);
+    int H = streams.size(1);
+    int D = streams.size(2);
+    int M = fn_q.size(0);
+    TORCH_CHECK(up_q.dim() == 4 && up_q.size(0) == H && up_q.size(1) == D / 4 && up_q.size(3) == 4,
+                "gr_mix_int8: up_q must be the (H, D / 4, LR, 4) layout");
+    int LR = up_q.size(2);
+    TORCH_CHECK(H == 4, "gr_mix_int8: H = 4 only");
+    TORCH_CHECK(D % 8 == 0, "gr_mix_int8: dims");
+    TORCH_CHECK(M == LR + (post ? H : 0), "gr_mix_int8: fn rows must be LR (+ H with post)");
+    TORCH_CHECK(fn_q.size(1) == H * D && w.numel() == H * D, "gr_mix_int8: dims");
+    TORCH_CHECK(fn_s.numel() == M && up_s.numel() == H * D, "gr_mix_int8: scale shapes");
+    TORCH_CHECK(dots.size(0) == R && dots.size(1) == M + 1 && dots.size(2) == H, "gr_mix_int8: dots shape");
+
+    dim3 grid_a(M + 1, R);
+    gr_dots_i8_kernel<4><<<grid_a, GR_THREADS_A, 0, stream>>>
+    (
+        (const float*) streams.data_ptr(), (const int8_t*) fn_q.data_ptr(),
+        (const float*) fn_s.data_ptr(), (float*) dots.data_ptr(), M, D
+    );
+    cuda_check(cudaPeekAtLastError());
+
+    const int gran = 4 * (NUM_THREADS / 32);
+    int chunks_c = std::max(1, std::min((D + gran - 1) / gran, 512 / R));
+    int chunk_cols = ((D / chunks_c + gran - 1) / gran) * gran;
+    int n_chunks = (D + chunk_cols - 1) / chunk_cols;
+    dim3 grid_c(n_chunks, R);
+    int smem = LR * sizeof(float);
+    float* post_p = post ? (float*) post.value().data_ptr() : nullptr;
+    #define ARGS_I8 \
+        (const float*) streams.data_ptr(), (const float*) dots.data_ptr(), \
+        (const int8_t*) up_q.data_ptr(), (const float*) up_s.data_ptr(), (const half*) w.data_ptr(), \
+        post_p, mixed.data_ptr(), D, LR, chunk_cols, (float) rms_eps
+    if (mixed.dtype() == at::kHalf)
+        gr_finalize_i8_kernel<4, true><<<grid_c, NUM_THREADS, smem, stream>>>(ARGS_I8);
+    else
+        gr_finalize_i8_kernel<4, false><<<grid_c, NUM_THREADS, smem, stream>>>(ARGS_I8);
+    #undef ARGS_I8
     cuda_check(cudaPeekAtLastError());
 }
