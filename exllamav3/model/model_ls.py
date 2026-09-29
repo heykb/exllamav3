@@ -9,6 +9,7 @@ from ..util.memory import (
     set_memory_fraction_reserve,
     set_memory_fraction_use,
     unset_memory_fraction,
+    uma_memory_headroom,
     free_mem,
     device_mem_info,
 )
@@ -241,7 +242,11 @@ class Model_LSMixin(ABC):
                                 # real forward. What the largest transient can still draw on is the
                                 # free device memory plus the allocator's reserved-but-unallocated
                                 # pool
-                                free_now, _ = device_mem_info(load_device)
+                                # On opted-in GB10 UMA, refresh host/memcg headroom after
+                                # the OS reserve instead of freezing conservative CUDA free.
+                                free_now = uma_memory_headroom(load_device)
+                                if free_now is None:
+                                    free_now, _ = device_mem_info(load_device)
                                 reusable = free_now + torch.cuda.memory_reserved(load_device) - \
                                     torch.cuda.memory_allocated(load_device)
                                 if reusable < max_transient[i] + autosplit_margin:

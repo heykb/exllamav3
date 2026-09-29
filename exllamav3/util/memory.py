@@ -3,7 +3,179 @@ from collections import deque
 import torch
 import gc
 import sys
+import os
+import re
+from pathlib import PurePosixPath
 from pydantic import PydanticUserError
+
+
+def _uma_enabled():
+    mode = os.environ.get("EXL3_UMA", "0")
+    if mode not in ("0", "1"):
+        raise RuntimeError("EXL3_UMA must be 0 or 1")
+    return mode == "1"
+
+
+def _uma_uint(value, source):
+    if not re.fullmatch(r"[0-9]+", value):
+        raise RuntimeError(f"EXL3_UMA: invalid nonnegative integer in {source}")
+    return int(value)
+
+
+def _uma_read(path):
+    try:
+        with open(path, encoding = "utf-8") as f:
+            return f.read()
+    except (OSError, UnicodeError) as e:
+        raise RuntimeError(f"EXL3_UMA: required telemetry unavailable: {path}") from e
+
+
+def _uma_cgroup_dirs():
+    entries = [line.split(":", 2) for line in _uma_read("/proc/self/cgroup").splitlines()]
+    groups = [p[2] for p in entries if len(p) == 3 and p[:2] == ["0", ""]]
+    if len(groups) != 1:
+        raise RuntimeError("EXL3_UMA: exactly one unified cgroup-v2 membership is required")
+    group = _uma_absolute_path(groups[0])
+    mounts = []
+    for line in _uma_read("/proc/self/mountinfo").splitlines():
+        left, sep, right = line.partition(" - ")
+        if not sep or not right.split() or right.split()[0] != "cgroup2":
+            continue
+        fields = left.split()
+        if len(fields) < 6:
+            raise RuntimeError("EXL3_UMA: malformed cgroup2 mountinfo")
+        # mountinfo escapes spaces, tabs, newlines and backslashes as octal.
+        root, mount = [_uma_absolute_path(re.sub(r"\\([0-7]{3})", lambda m: chr(int(m[1], 8)), s))
+                       for s in fields[3:5]]
+        if group == root or root in group.parents:
+            mounts.append((root, mount))
+    if not mounts:
+        raise RuntimeError("EXL3_UMA: cannot map membership to a visible cgroup2 mount")
+    # Prefer the broadest visible hierarchy, not a bind mount hiding a parent limit.
+    root, mount = min(mounts, key = lambda pair: len(pair[0].parts))
+    path = mount / group.relative_to(root)
+    result = []
+    while True:
+        result.append(str(path))
+        if path == mount:
+            return result
+        path = path.parent
+
+
+def _uma_absolute_path(value):
+    path = PurePosixPath(value)
+    if not value.startswith("/") or value.startswith("//") or ".." in path.parts or str(path) != value:
+        raise RuntimeError("EXL3_UMA: unsupported cgroup path")
+    return path
+
+
+def _uma_cgroup_headroom():
+    limits = []
+    paths = _uma_cgroup_dirs()
+    for index, path in enumerate(paths):
+        current_path = path + "/memory.current"
+        max_path = path + "/memory.max"
+        stat_path = path + "/memory.stat"
+        current_present = os.path.exists(current_path)
+        max_present = os.path.exists(max_path)
+        if not current_present and not max_present and index in (0, len(paths) - 1):
+            # systemd may leave a transient leaf scope uncontrolled, while the cgroup2 mount
+            # root can expose aggregate stats without current/max. Controlled parents between
+            # them must remain complete so a finite limit cannot be hidden.
+            continue
+        if not current_present or not max_present or not os.path.exists(stat_path):
+            raise RuntimeError(f"EXL3_UMA: required telemetry unavailable or incomplete at {path}")
+        limits.append(_uma_cgroup_limit(path))
+    if not limits:
+        raise RuntimeError("EXL3_UMA: no visible cgroup level has memory-controller telemetry")
+    finite = [limit for limit in limits if limit is not None]
+    return min(finite) if finite else None
+
+
+def _uma_cgroup_limit(path):
+    current = _uma_uint(_uma_read(path + "/memory.current").strip(), path + "/memory.current")
+    raw_limit = _uma_read(path + "/memory.max").strip()
+    limit = None if raw_limit == "max" else _uma_uint(raw_limit, path + "/memory.max")
+    stat = {}
+    for line in _uma_read(path + "/memory.stat").splitlines():
+        parts = line.split()
+        if len(parts) != 2 or parts[0] in stat:
+            raise RuntimeError(f"EXL3_UMA: invalid memory.stat at {path}")
+        stat[parts[0]] = _uma_uint(parts[1], path + "/memory.stat")
+    required = {"file", "inactive_file", "file_dirty", "file_writeback", "shmem"}
+    if not required <= stat.keys():
+        raise RuntimeError(f"EXL3_UMA: incomplete memory.stat at {path}")
+    # Never count active cache, swap, shmem, dirty or in-flight writeback as reclaimable.
+    clean = max(0, min(current, stat["file"], stat["inactive_file"])
+                - stat["file_dirty"] - stat["file_writeback"] - stat["shmem"])
+    return None if limit is None else max(0, limit - current + clean)
+
+
+def _uma_snapshot(device):
+    props = torch.cuda.get_device_properties(device)
+    if (sys.platform != "linux" or torch.cuda.device_count() != 1
+            or props.name not in ("NVIDIA GB10", "GB10")
+            or (props.major, props.minor) != (12, 1)
+            or not getattr(props, "integrated", True)):
+        raise RuntimeError("EXL3_UMA=1 requires Linux and one visible integrated NVIDIA GB10 GPU")
+    reserve = _uma_uint(os.environ.get("EXL3_UMA_RESERVE_MB", "8192"), "EXL3_UMA_RESERVE_MB") << 20
+    mem = {}
+    for line in _uma_read("/proc/meminfo").splitlines():
+        parts = line.split()
+        if parts and parts[0] in ("MemTotal:", "MemAvailable:"):
+            if len(parts) != 3 or parts[2] != "kB" or parts[0] in mem:
+                raise RuntimeError("EXL3_UMA: invalid /proc/meminfo")
+            mem[parts[0]] = _uma_uint(parts[1], "/proc/meminfo") << 10
+    if (set(mem) != {"MemTotal:", "MemAvailable:"} or not mem["MemTotal:"]
+            or mem["MemAvailable:"] > mem["MemTotal:"]):
+        raise RuntimeError("EXL3_UMA: missing or invalid physical MemAvailable/MemTotal")
+    total = props.total_memory
+    current = torch.cuda.memory_reserved(device)
+    if type(total) is not int or type(current) is not int or not 0 <= current <= total or total <= 0:
+        raise RuntimeError("EXL3_UMA: invalid CUDA total/reserved telemetry")
+    cgroup = _uma_cgroup_headroom()
+    available = mem["MemAvailable:"]
+    raw = min(available, total - current, available if cgroup is None else cgroup)
+    return dict(total = total, current = current, host_available = available,
+                cgroup_headroom = cgroup, device_headroom = total - current,
+                reserve = reserve, raw_headroom = raw)
+
+
+def uma_memory_headroom(device):
+    """Fresh additional physical bytes after the OS reserve, or None outside UMA mode.
+
+    This is a conservative planning snapshot, not a promise of successful allocation.
+    Allocator reserved-but-unallocated bytes are already charged; callers may reuse
+    those separately but must not add the whole current reservation as free memory.
+    """
+    if not _uma_enabled():
+        return None
+    snapshot = _uma_snapshot(device)
+    return max(0, snapshot["raw_headroom"] - snapshot["reserve"])
+
+
+def _uma_set_fraction(amount, device, reserve_mode = False):
+    if type(amount) is not int or amount < 0:
+        raise RuntimeError("EXL3_UMA: use/reserve must be a nonnegative integer byte count")
+    snapshot = _uma_snapshot(device)
+    reserve = max(snapshot["reserve"], amount) if reserve_mode else snapshot["reserve"]
+    headroom = max(0, snapshot["raw_headroom"] - reserve)
+    if not headroom:
+        raise RuntimeError("EXL3_UMA: no headroom after the OS reserve")
+    extra = headroom if reserve_mode else min(amount, headroom)
+    budget = snapshot["current"] + extra
+    fraction = budget / snapshot["total"]
+    torch.cuda.set_per_process_memory_fraction(fraction, device = device)
+    cap = int(fraction * snapshot["total"])
+    cgroup = snapshot["cgroup_headroom"]
+    print(f"EXL3_UMA device={device} mode={'reserve' if reserve_mode else 'use'} "
+          f"request_bytes={amount} current={snapshot['current']} "
+          f"host_available={snapshot['host_available']} "
+          f"cgroup_headroom={cgroup if cgroup is not None else 'unlimited'} "
+          f"device_headroom={snapshot['device_headroom']} os_reserve={snapshot['reserve']} "
+          f"effective_reserve={reserve} additional_headroom={headroom} cap_bytes={cap} "
+          f"fraction={fraction:.17g}", flush = True)
+    return cap
 
 # @lru_cache
 # def init_pynvml():
@@ -45,6 +217,8 @@ def set_memory_fraction_reserve(
     device: int
 ):
     touch_device(device)
+    if _uma_enabled():
+        return _uma_set_fraction(reserve, device, reserve_mode = True)
     free, total = device_mem_info(device)
     # mem_get_info reports memory free *after* whatever this process has already reserved, but
     # set_per_process_memory_fraction limits the process's *cumulative* reserved bytes. Add the
@@ -68,6 +242,8 @@ def set_memory_fraction_use(
     device: int
 ):
     touch_device(device)
+    if _uma_enabled():
+        return _uma_set_fraction(use, device)
     total = torch.cuda.get_device_properties(device).total_memory
     current = torch.cuda.memory_reserved(device)
     # The budget cannot exceed what the device can still give: a split value at or above the
@@ -83,7 +259,12 @@ def set_memory_fraction_use(
 # Un-reserve VRAM
 def unset_memory_fraction(active_devices: list[int]):
     for i in active_devices:
-        torch.cuda.set_per_process_memory_fraction(1.0, device = i)
+        if _uma_enabled():
+            # Drop the per-load request, not the shared-RAM OS reserve. Re-sample
+            # after loading so inference does not inherit a stale startup budget.
+            _uma_set_fraction(0, i, reserve_mode = True)
+        else:
+            torch.cuda.set_per_process_memory_fraction(1.0, device = i)
 
 
 # Free unused VRAM
